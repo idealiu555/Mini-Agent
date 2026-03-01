@@ -262,7 +262,9 @@ class TestMCPServerConnectionTimeout:
 @pytest.mark.asyncio
 async def test_url_config_validation():
     """Test that URL-based config without url is rejected."""
+    tmp_path = None
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        tmp_path = Path(f.name)
         config = {
             "mcpServers": {
                 "broken-sse": {
@@ -280,13 +282,16 @@ async def test_url_config_validation():
             assert tools == []
         finally:
             await cleanup_mcp_connections()
-            Path(f.name).unlink()
+    if tmp_path and tmp_path.exists():
+        tmp_path.unlink()
 
 
 @pytest.mark.asyncio
 async def test_stdio_config_validation():
     """Test that STDIO config without command is rejected."""
+    tmp_path = None
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        tmp_path = Path(f.name)
         config = {
             "mcpServers": {
                 "broken-stdio": {
@@ -304,13 +309,16 @@ async def test_stdio_config_validation():
             assert tools == []
         finally:
             await cleanup_mcp_connections()
-            Path(f.name).unlink()
+    if tmp_path and tmp_path.exists():
+        tmp_path.unlink()
 
 
 @pytest.mark.asyncio
 async def test_mixed_config_loading():
     """Test loading config with both STDIO and URL-based servers."""
+    tmp_path = None
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        tmp_path = Path(f.name)
         config = {
             "mcpServers": {
                 "stdio-server": {"command": "npx", "args": ["-y", "nonexistent-server"], "disabled": True},
@@ -327,7 +335,8 @@ async def test_mixed_config_loading():
             assert tools == []
         finally:
             await cleanup_mcp_connections()
-            Path(f.name).unlink()
+    if tmp_path and tmp_path.exists():
+        tmp_path.unlink()
 
 
 @pytest.mark.asyncio
@@ -357,15 +366,15 @@ async def test_mcp_tools_loading():
 
 
 @pytest.mark.asyncio
-async def test_git_mcp_loading(mcp_config):
-    """Test loading MCP Server from Git repository (minimax_search)."""
+async def test_tavily_mcp_loading(mcp_config):
+    """Test loading Tavily MCP server from npm package."""
     print("\n" + "=" * 70)
-    print("Testing: Loading MiniMax Search MCP Server from Git repository")
+    print("Testing: Loading Tavily MCP Server from npm package")
     print("=" * 70)
 
-    git_url = mcp_config["mcpServers"]["minimax_search"]["args"][1]
-    print(f"\n📍 Git repository: {git_url}")
-    print("⏳ Cloning and installing...\n")
+    package_name = mcp_config["mcpServers"]["tavily_search"]["args"][1]
+    print(f"\n📍 npm package: {package_name}")
+    print("⏳ Installing and connecting...\n")
 
     try:
         # Load MCP tools
@@ -385,8 +394,8 @@ async def test_git_mcp_loading(mcp_config):
                 print(f"  • {tool.name}")
                 print(f"    {desc}")
 
-        # Verify expected tools from minimax_search
-        expected_tools = ["search", "parallel_search", "browse"]
+        # Verify expected tools from Tavily MCP
+        expected_tools = ["tavily_search", "tavily_extract", "tavily_map", "tavily_crawl"]
         loaded_tool_names = [t.name for t in tools]
 
         print("\n🔍 Function verification:")
@@ -398,18 +407,21 @@ async def test_git_mcp_loading(mcp_config):
             else:
                 print(f"  ❌ {expected} - Missing")
 
-        # If no expected tools found, minimax_search connection failed
+        # If no expected tools found, Tavily connection likely failed
         if found_count == 0:
-            print("\n⚠️  Warning: minimax_search MCP Server connection failed")
-            print("This may be due to SSH key authentication requirements or network issues")
-            pytest.skip("minimax_search MCP Server connection failed, skipping test")
+            print("\n⚠️  Warning: tavily_search MCP Server connection failed")
+            print("This may be due to missing TAVILY_API_KEY or network issues")
+            pytest.fail(
+                "tavily_search MCP Server connection failed: expected Tavily tools were not loaded. "
+                "Check TAVILY_API_KEY/network/MCP startup logs."
+            )
 
         # Assert all expected tools exist
         missing_tools = [t for t in expected_tools if t not in loaded_tool_names]
         assert len(missing_tools) == 0, f"Missing tools: {missing_tools}"
 
         print("\n" + "=" * 70)
-        print("✅ All tests passed! MCP Server loaded from Git repository successfully!")
+        print("✅ All tests passed! Tavily MCP Server loaded successfully!")
         print("=" * 70)
 
     finally:
@@ -427,8 +439,7 @@ async def test_git_mcp_tool_availability():
         tools = await load_mcp_tools_async("mini_agent/config/mcp.json")
 
         if not tools:
-            pytest.skip("No MCP tools loaded")
-            return
+            pytest.fail("No MCP tools loaded from mini_agent/config/mcp.json")
 
         # Find search tool
         search_tool = None
@@ -449,13 +460,17 @@ async def test_mcp_tool_execution():
     """Test executing an MCP tool if available (memory server)."""
     print("\n=== Testing MCP Tool Execution ===")
 
+    original = get_mcp_timeout_config()
+    original_connect = original.connect_timeout
+
     try:
+        # npx-based MCP servers may need longer startup on first run
+        set_mcp_timeout_config(connect_timeout=30.0)
         tools = await load_mcp_tools_async("mini_agent/config/mcp.json")
 
         if not tools:
             print("⚠️  No MCP tools loaded, skipping execution test")
-            pytest.skip("No MCP tools available")
-            return
+            pytest.skip("No MCP tools available for execution test")
 
         # Try to find and test create_entities (from memory server)
         create_tool = None
@@ -482,9 +497,10 @@ async def test_mcp_tool_execution():
                 pytest.fail(f"Tool execution failed: {e}")
         else:
             print("⚠️  create_entities tool not found, skipping execution test")
-            pytest.skip("create_entities tool not available")
+            pytest.fail("create_entities tool not available")
 
     finally:
+        set_mcp_timeout_config(connect_timeout=original_connect)
         await cleanup_mcp_connections()
 
 
@@ -527,7 +543,9 @@ async def test_per_server_timeout_override_in_config():
     """Test that per-server timeout overrides from config are respected."""
     print("\n=== Testing Per-Server Timeout Override ===")
 
+    tmp_path = None
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        tmp_path = Path(f.name)
         config = {
             "mcpServers": {
                 "fast-server": {
@@ -555,7 +573,8 @@ async def test_per_server_timeout_override_in_config():
 
         finally:
             await cleanup_mcp_connections()
-            Path(f.name).unlink()
+    if tmp_path and tmp_path.exists():
+        tmp_path.unlink()
 
 
 async def main():

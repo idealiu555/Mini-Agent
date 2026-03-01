@@ -106,13 +106,8 @@ class MiniMaxACPAgent:
     async def prompt(self, params: PromptRequest) -> PromptResponse:
         state = self._sessions.get(params.sessionId)
         if not state:
-            # Auto-create session if not found (compatibility with clients that skip newSession)
-            logger.warning(f"Session '{params.sessionId}' not found, auto-creating new session")
-            new_session = await self.newSession(NewSessionRequest(cwd=None))
-            state = self._sessions.get(new_session.sessionId)
-            if not state:
-                logger.error("Failed to auto-create session")
-                return PromptResponse(stopReason="refusal")
+            logger.warning(f"Session '{params.sessionId}' not found")
+            return PromptResponse(stopReason="refusal")
         state.cancelled = False
         user_text = "\n".join(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "") for block in params.prompt)
         state.agent.messages.append(Message(role="user", content=user_text))
@@ -140,7 +135,15 @@ class MiniMaxACPAgent:
                 await self._send(session_id, update_agent_thought(text_block(response.thinking)))
             if response.content:
                 await self._send(session_id, update_agent_message(text_block(response.content)))
-            agent.messages.append(Message(role="assistant", content=response.content, thinking=response.thinking, tool_calls=response.tool_calls))
+            agent.messages.append(
+                Message(
+                    role="assistant",
+                    content=response.content,
+                    thinking=response.thinking,
+                    thinking_blocks=response.thinking_blocks,
+                    tool_calls=response.tool_calls,
+                )
+            )
             if not response.tool_calls:
                 return "end_turn"
             for call in response.tool_calls:

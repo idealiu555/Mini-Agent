@@ -209,7 +209,7 @@ cp mini_agent/config/config-example.yaml mini_agent/config/config.yaml
 如果你有好的使用示例，欢迎提交 PR！
 
 建议的新示例方向：
-- Web 搜索集成示例（使用 MiniMax Search MCP）
+- Web 搜索集成示例（使用 Tavily Search MCP）
 - Skills 使用示例（文档处理、设计等）
 - 自定义工具开发示例
 - 错误处理和重试机制示例

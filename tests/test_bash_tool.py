@@ -7,6 +7,14 @@ import pytest
 from mini_agent.tools.bash_tool import BackgroundShellManager, BashKillTool, BashOutputTool, BashTool
 
 
+@pytest.fixture(autouse=True)
+async def _cleanup_background_shells():
+    """Ensure no background shell subprocesses leak across tests."""
+    yield
+    await BackgroundShellManager.terminate_all()
+    await asyncio.sleep(0.05)
+
+
 @pytest.mark.asyncio
 async def test_foreground_command():
     """Test executing a simple foreground command."""
@@ -27,7 +35,9 @@ async def test_foreground_command_with_stderr():
     print("\n=== Testing Stdout/Stderr Separation ===")
 
     bash_tool = BashTool()
-    result = await bash_tool.execute(command="echo 'stdout message' && echo 'stderr message' >&2")
+    result = await bash_tool.execute(
+        command='python -c "import sys; print(\'stdout message\'); print(\'stderr message\', file=sys.stderr)"'
+    )
 
     assert result.success
     assert "stdout message" in result.stdout

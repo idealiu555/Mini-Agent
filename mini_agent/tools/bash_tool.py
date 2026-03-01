@@ -179,13 +179,19 @@ class BackgroundShellManager:
         cls._monitor_tasks[bash_id] = task
 
     @classmethod
-    def _cancel_monitor(cls, bash_id: str) -> None:
+    async def _cancel_monitor(cls, bash_id: str) -> None:
         """Cancel and remove a monitoring task (internal use only)."""
-        if bash_id in cls._monitor_tasks:
-            task = cls._monitor_tasks[bash_id]
+        task = cls._monitor_tasks.get(bash_id)
+        if task is not None:
             if not task.done():
                 task.cancel()
-            del cls._monitor_tasks[bash_id]
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            cls._monitor_tasks.pop(bash_id, None)
 
     @classmethod
     async def terminate(cls, bash_id: str) -> BackgroundShell:
@@ -208,10 +214,32 @@ class BackgroundShellManager:
         await shell.terminate()
 
         # Clean up monitoring and remove from manager
-        cls._cancel_monitor(bash_id)
+        await cls._cancel_monitor(bash_id)
         cls._remove(bash_id)
 
         return shell
+
+    @classmethod
+    async def terminate_all(cls) -> None:
+        """Terminate all managed background shells and monitoring tasks."""
+        bash_ids = list(cls._shells.keys())
+        for bash_id in bash_ids:
+            try:
+                await cls.terminate(bash_id)
+            except Exception:
+                pass
+
+        # Extra safety: cancel any lingering monitor tasks
+        for bash_id, task in list(cls._monitor_tasks.items()):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            cls._monitor_tasks.pop(bash_id, None)
 
 
 class BashTool(Tool):

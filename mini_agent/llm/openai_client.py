@@ -162,7 +162,9 @@ class OpenAIClient(LLMClientBase):
                 # The complete response_message (including reasoning_details) must be
                 # preserved in Message History and passed back to the model in the next turn.
                 # This ensures the model's chain of thought is not interrupted.
-                if msg.thinking:
+                if msg.thinking_blocks:
+                    assistant_msg["reasoning_details"] = msg.thinking_blocks
+                elif msg.thinking:
                     assistant_msg["reasoning_details"] = [{"text": msg.thinking}]
 
                 api_messages.append(assistant_msg)
@@ -200,6 +202,29 @@ class OpenAIClient(LLMClientBase):
             "tools": tools,
         }
 
+    @staticmethod
+    def _serialize_reasoning_detail(detail: Any) -> dict[str, Any]:
+        """Serialize a reasoning detail block to a replayable dict."""
+        if isinstance(detail, dict):
+            return detail
+
+        if hasattr(detail, "model_dump"):
+            dumped = detail.model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+
+        serialized: dict[str, Any] = {}
+        for attr in ("type", "text", "signature", "index"):
+            if hasattr(detail, attr):
+                value = getattr(detail, attr)
+                if value is not None:
+                    serialized[attr] = value
+        if "text" not in serialized and hasattr(detail, "content"):
+            content = getattr(detail, "content")
+            if isinstance(content, str):
+                serialized["text"] = content
+        return serialized
+
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse OpenAI response into LLMResponse.
 
@@ -217,11 +242,20 @@ class OpenAIClient(LLMClientBase):
 
         # Extract thinking content from reasoning_details
         thinking_content = ""
+        reasoning_blocks: list[dict[str, Any]] = []
         if hasattr(message, "reasoning_details") and message.reasoning_details:
             # reasoning_details is a list of reasoning blocks
             for detail in message.reasoning_details:
-                if hasattr(detail, "text"):
-                    thinking_content += detail.text
+                serialized = self._serialize_reasoning_detail(detail)
+                if serialized:
+                    reasoning_blocks.append(serialized)
+
+                if isinstance(detail, dict):
+                    text = detail.get("text")
+                else:
+                    text = getattr(detail, "text", None)
+                if isinstance(text, str):
+                    thinking_content += text
 
         # Extract tool calls
         tool_calls = []
@@ -253,6 +287,7 @@ class OpenAIClient(LLMClientBase):
         return LLMResponse(
             content=text_content,
             thinking=thinking_content if thinking_content else None,
+            thinking_blocks=reasoning_blocks if reasoning_blocks else None,
             tool_calls=tool_calls if tool_calls else None,
             finish_reason="stop",  # OpenAI doesn't provide finish_reason in the message
             usage=usage,

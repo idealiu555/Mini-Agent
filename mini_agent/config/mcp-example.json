@@ -1,18 +1,15 @@
 {
     "mcpServers": {
-        "minimax_search": {
-            "description": "MiniMax Search - Powerful web search and intelligent browsing ⭐",
+        "tavily_search": {
+            "description": "Tavily Search - Real-time web search, extract, map, and crawl",
             "type": "stdio",
-            "command": "uvx",
+            "command": "npx",
             "args": [
-                "--from",
-                "git+https://github.com/MiniMax-AI/minimax_search",
-                "minimax-search"
+                "-y",
+                "tavily-mcp@latest"
             ],
             "env": {
-                "JINA_API_KEY": "",
-                "SERPER_API_KEY": "",
-                "MINIMAX_API_KEY": ""
+                "TAVILY_API_KEY": ""
             },
             "disabled": true
         },

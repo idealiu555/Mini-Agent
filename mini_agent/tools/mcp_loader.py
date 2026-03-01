@@ -168,6 +168,19 @@ class MCPServerConnection:
         """Get effective execute timeout."""
         return self.execute_timeout or _default_timeout_config.execute_timeout
 
+    async def _safe_close_exit_stack(self) -> None:
+        """Close exit stack without letting cleanup exceptions propagate."""
+        if not self.exit_stack:
+            return
+        try:
+            await self.exit_stack.aclose()
+        except asyncio.CancelledError:
+            pass
+        except BaseException:
+            pass
+        finally:
+            self.exit_stack = None
+
     async def connect(self) -> bool:
         """Connect to the MCP server with timeout protection."""
         connect_timeout = self._get_connect_timeout()
@@ -216,16 +229,12 @@ class MCPServerConnection:
 
         except TimeoutError:
             print(f"✗ Connection to MCP server '{self.name}' timed out after {connect_timeout}s")
-            if self.exit_stack:
-                await self.exit_stack.aclose()
-                self.exit_stack = None
+            await self._safe_close_exit_stack()
             return False
 
         except Exception as e:
             print(f"✗ Failed to connect to MCP server '{self.name}': {e}")
-            if self.exit_stack:
-                await self.exit_stack.aclose()
-                self.exit_stack = None
+            await self._safe_close_exit_stack()
             import traceback
 
             traceback.print_exc()
@@ -271,6 +280,10 @@ class MCPServerConnection:
         if self.exit_stack:
             try:
                 await self.exit_stack.aclose()
+            except asyncio.CancelledError:
+                # Some MCP stdio servers may terminate with non-zero exit code
+                # during shutdown, which can propagate as cancellation here.
+                pass
             except Exception:
                 # anyio cancel scope may raise RuntimeError or ExceptionGroup
                 # when stdio_client's task group is closed from a different
@@ -429,5 +442,9 @@ async def cleanup_mcp_connections():
     """Clean up all MCP connections."""
     global _mcp_connections
     for connection in _mcp_connections:
-        await connection.disconnect()
+        try:
+            await connection.disconnect()
+        except asyncio.CancelledError:
+            # Best-effort cleanup: ignore cancellation from subprocess shutdown.
+            pass
     _mcp_connections.clear()

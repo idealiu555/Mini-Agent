@@ -399,6 +399,7 @@ Requirements:
                 role="assistant",
                 content=response.content,
                 thinking=response.thinking,
+                thinking_blocks=response.thinking_blocks,
                 tool_calls=response.tool_calls,
             )
             self.messages.append(assistant_msg)

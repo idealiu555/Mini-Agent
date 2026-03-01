@@ -135,8 +135,11 @@ class AnthropicClient(LLMClientBase):
                     # Build content blocks for assistant with thinking and/or tool calls
                     content_blocks = []
 
-                    # Add thinking block if present
-                    if msg.thinking:
+                    # Add replayable thinking blocks if present
+                    if msg.thinking_blocks:
+                        content_blocks.extend(msg.thinking_blocks)
+                    elif msg.thinking:
+                        # Backward compatibility for historical string-only thinking
                         content_blocks.append({"type": "thinking", "thinking": msg.thinking})
 
                     # Add text content if present
@@ -199,6 +202,22 @@ class AnthropicClient(LLMClientBase):
             "tools": tools,
         }
 
+    @staticmethod
+    def _serialize_thinking_block(block: Any) -> dict[str, Any]:
+        """Serialize an Anthropic thinking block to a replayable dict."""
+        if hasattr(block, "model_dump"):
+            dumped = block.model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+
+        serialized: dict[str, Any] = {"type": "thinking"}
+        for attr in ("thinking", "signature"):
+            if hasattr(block, attr):
+                value = getattr(block, attr)
+                if value is not None:
+                    serialized[attr] = value
+        return serialized
+
     def _parse_response(self, response: anthropic.types.Message) -> LLMResponse:
         """Parse Anthropic response into LLMResponse.
 
@@ -211,6 +230,7 @@ class AnthropicClient(LLMClientBase):
         # Extract text content, thinking, and tool calls
         text_content = ""
         thinking_content = ""
+        thinking_blocks: list[dict[str, Any]] = []
         tool_calls = []
 
         for block in response.content:
@@ -218,6 +238,7 @@ class AnthropicClient(LLMClientBase):
                 text_content += block.text
             elif block.type == "thinking":
                 thinking_content += block.thinking
+                thinking_blocks.append(self._serialize_thinking_block(block))
             elif block.type == "tool_use":
                 # Parse Anthropic tool_use block
                 tool_calls.append(
@@ -249,6 +270,7 @@ class AnthropicClient(LLMClientBase):
         return LLMResponse(
             content=text_content,
             thinking=thinking_content if thinking_content else None,
+            thinking_blocks=thinking_blocks if thinking_blocks else None,
             tool_calls=tool_calls if tool_calls else None,
             finish_reason=response.stop_reason or "stop",
             usage=usage,

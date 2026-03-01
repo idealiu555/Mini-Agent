@@ -10,9 +10,18 @@ import pytest
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.config import Config
+from mini_agent.schema import LLMProvider
 from mini_agent.tools import BashTool, EditTool, ReadTool, WriteTool
-from mini_agent.tools.mcp_loader import load_mcp_tools_async
+from mini_agent.tools.mcp_loader import cleanup_mcp_connections
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
+
+
+@pytest.fixture(autouse=True)
+async def _cleanup_mcp_after_each_test():
+    """Ensure MCP subprocesses are closed before event loop teardown."""
+    yield
+    await cleanup_mcp_connections()
+    await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio
@@ -33,6 +42,11 @@ async def test_basic_agent_usage():
 
     config = Config.from_yaml(config_path)
 
+    try:
+        provider = LLMProvider(config.llm.provider.lower())
+    except ValueError:
+        pytest.fail(f"Unsupported provider in config.yaml: {config.llm.provider}")
+
     # Check API key
     if not config.llm.api_key or config.llm.api_key == "YOUR_MINIMAX_API_KEY_HERE":
         pytest.skip("API key not configured")
@@ -49,6 +63,7 @@ async def test_basic_agent_usage():
         # Initialize LLM client
         llm_client = LLMClient(
             api_key=config.llm.api_key,
+            provider=provider,
             api_base=config.llm.api_base,
             model=config.llm.model,
         )
@@ -70,20 +85,8 @@ async def test_basic_agent_usage():
             ]
         )
 
-        # Load MCP tools (optional) - with timeout protection
-        try:
-            # MCP tools are disabled by default to prevent test hangs
-            # Enable specific MCP servers in mcp.json if needed
-            mcp_tools = await load_mcp_tools_async(
-                config_path="mini_agent/config/mcp.json"
-            )
-            if mcp_tools:
-                print(f"✓ Loaded {len(mcp_tools)} MCP tools")
-                tools.extend(mcp_tools)
-            else:
-                print("⚠️  No MCP tools configured (mcp.json is empty)")
-        except Exception as e:
-            print(f"⚠️  MCP tools not loaded: {e}")
+        # Do not load MCP tools in this integration test.
+        # MCP servers spawn subprocesses and are fully validated in tests/test_mcp.py.
 
         # Create agent
         agent = Agent(
@@ -105,6 +108,12 @@ async def test_basic_agent_usage():
 
         agent.add_user_message(task)
         result = await agent.run()
+
+        if "llm call failed" in result.lower() or "connection error" in result.lower():
+            pytest.fail(
+                "LLM call failed during integration test. "
+                f"provider={config.llm.provider}, api_base={config.llm.api_base}, result={result}"
+            )
 
         print("\n" + "=" * 80)
         print(f"Result: {result}")
@@ -137,6 +146,11 @@ async def test_session_memory_demo():
 
     config = Config.from_yaml(config_path)
 
+    try:
+        provider = LLMProvider(config.llm.provider.lower())
+    except ValueError:
+        pytest.fail(f"Unsupported provider in config.yaml: {config.llm.provider}")
+
     # Check API key
     if not config.llm.api_key or config.llm.api_key == "YOUR_MINIMAX_API_KEY_HERE":
         pytest.skip("API key not configured")
@@ -154,6 +168,7 @@ You have record_note and recall_notes tools:
         # Initialize LLM
         llm_client = LLMClient(
             api_key=config.llm.api_key,
+            provider=provider,
             api_base=config.llm.api_base,
             model=config.llm.model,
         )

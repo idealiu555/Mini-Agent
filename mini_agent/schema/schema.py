@@ -32,6 +32,7 @@ class Message(BaseModel):
     role: str  # "system", "user", "assistant", "tool"
     content: str | list[dict[str, Any]]  # Can be string or list of content blocks
     thinking: str | None = None  # Extended thinking content for assistant messages
+    thinking_blocks: list[dict[str, Any]] | None = None  # Raw replayable thinking blocks
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None  # For tool role
@@ -50,6 +51,7 @@ class LLMResponse(BaseModel):
 
     content: str
     thinking: str | None = None  # Extended thinking blocks
+    thinking_blocks: list[dict[str, Any]] | None = None  # Raw replayable thinking blocks
     tool_calls: list[ToolCall] | None = None
     finish_reason: str
     usage: TokenUsage | None = None  # Token usage from API response

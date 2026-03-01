@@ -22,22 +22,15 @@ class LLMClient:
     It automatically instantiates the correct underlying client based on
     the provider parameter.
 
-    For MiniMax API (api.minimax.io or api.minimaxi.com), it appends the
-    appropriate endpoint suffix based on provider:
-    - anthropic: /anthropic
-    - openai: /v1
-
-    For third-party APIs, it uses the api_base as-is.
+    The api_base value is always used as-is. Users must provide a complete
+    endpoint that matches the selected provider protocol.
     """
-
-    # MiniMax API domains that need automatic suffix handling
-    MINIMAX_DOMAINS = ("api.minimax.io", "api.minimaxi.com")
 
     def __init__(
         self,
         api_key: str,
         provider: LLMProvider = LLMProvider.ANTHROPIC,
-        api_base: str = "https://api.minimaxi.com",
+        api_base: str = "https://api.minimaxi.com/anthropic",
         model: str = "MiniMax-M2.5",
         retry_config: RetryConfig | None = None,
     ):
@@ -46,9 +39,8 @@ class LLMClient:
         Args:
             api_key: API key for authentication
             provider: LLM provider (anthropic or openai)
-            api_base: Base URL for the API (default: https://api.minimaxi.com)
-                     For MiniMax API, suffix is auto-appended based on provider.
-                     For third-party APIs (e.g., https://api.siliconflow.cn/v1), used as-is.
+            api_base: Complete base URL endpoint for the selected provider protocol.
+                     The value is used as-is (no auto suffixing).
             model: Model name to use
             retry_config: Optional retry configuration
         """
@@ -58,24 +50,7 @@ class LLMClient:
         self.retry_config = retry_config or RetryConfig()
 
         # Normalize api_base (remove trailing slash)
-        api_base = api_base.rstrip("/")
-
-        # Check if this is a MiniMax API endpoint
-        is_minimax = any(domain in api_base for domain in self.MINIMAX_DOMAINS)
-
-        if is_minimax:
-            # For MiniMax API, ensure correct suffix based on provider
-            # Strip any existing suffix first
-            api_base = api_base.replace("/anthropic", "").replace("/v1", "")
-            if provider == LLMProvider.ANTHROPIC:
-                full_api_base = f"{api_base}/anthropic"
-            elif provider == LLMProvider.OPENAI:
-                full_api_base = f"{api_base}/v1"
-            else:
-                raise ValueError(f"Unsupported provider: {provider}")
-        else:
-            # For third-party APIs, use api_base as-is
-            full_api_base = api_base
+        full_api_base = api_base.rstrip("/")
 
         self.api_base = full_api_base
 

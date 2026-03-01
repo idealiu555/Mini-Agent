@@ -23,8 +23,8 @@ class LLMConfig(BaseModel):
     """LLM configuration"""
 
     api_key: str
-    api_base: str = "https://api.minimax.io"
-    model: str = "MiniMax-M2.5"
+    api_base: str = "https://coding.dashscope.aliyuncs.com/apps/anthropic"
+    model: str = "GLM-5"
     provider: str = "anthropic"  # "anthropic" or "openai"
     retry: RetryConfig = Field(default_factory=RetryConfig)
 
@@ -122,8 +122,8 @@ class Config(BaseModel):
 
         llm_config = LLMConfig(
             api_key=data["api_key"],
-            api_base=data.get("api_base", "https://api.minimax.io"),
-            model=data.get("model", "MiniMax-M2.5"),
+            api_base=data.get("api_base", "https://coding.dashscope.aliyuncs.com/apps/anthropic"),
+            model=data.get("model", "GLM-5"),
             provider=data.get("provider", "anthropic"),
             retry=retry_config,
         )
