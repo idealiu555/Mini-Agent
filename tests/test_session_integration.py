@@ -2,6 +2,7 @@
 Session integration tests - Testing multi-turn conversations and session management
 """
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -169,3 +170,29 @@ def test_message_statistics(mock_llm_client, temp_workspace):
     assert assistant_msgs == 1
     assert tool_msgs == 1
     assert len(agent.messages) == 5  # 1 system + 2 user + 1 assistant + 1 tool
+
+
+def test_agent_rejects_cross_loop_reuse(temp_workspace):
+    """Same Agent instance should not be reused across different event loops."""
+    llm_client = MagicMock(spec=LLMClient)
+    llm_client.generate = AsyncMock(
+        return_value=LLMResponse(
+            content="ok",
+            finish_reason="stop",
+            tool_calls=None,
+        )
+    )
+
+    agent = Agent(
+        llm_client=llm_client,
+        system_prompt="System",
+        tools=[],
+        workspace_dir=temp_workspace,
+    )
+
+    agent.add_user_message("first run")
+    asyncio.run(agent.run())
+
+    agent.add_user_message("second run")
+    with pytest.raises(RuntimeError, match="same event loop"):
+        asyncio.run(agent.run())

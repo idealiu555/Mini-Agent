@@ -2,14 +2,18 @@
 
 import asyncio
 import json
+import traceback
+from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
-from typing import Optional
+from typing import Any, Optional, TypedDict
 
 import tiktoken
+from langgraph.graph import END, START, StateGraph
 
 from .llm import LLMClient
 from .logger import AgentLogger
+from .retry import RetryExhaustedError
 from .schema import Message
 from .tools.base import Tool, ToolResult
 from .utils import calculate_display_width
@@ -42,8 +46,35 @@ class Colors:
     BRIGHT_WHITE = "\033[97m"
 
 
+class AgentGraphState(TypedDict, total=False):
+    """Runtime state for the LangGraph-based single agent workflow.
+
+    Field usage by node:
+    - summarize node: reads messages, step, done, final_response, run_start_time
+    - llm node: reads messages, step, run_start_time; writes messages, step, done,
+      final_response, pending_tool_calls, step_start_time
+    - tools node: reads messages, step, run_start_time, step_start_time, pending_tool_calls;
+      writes messages, step, done, final_response
+    """
+
+    messages: list[Message]  # Conversation history including system, user, assistant, tool messages
+    step: int  # Current step number (0-indexed)
+    done: bool  # Whether the workflow should terminate
+    final_response: str  # Final response to return to user when done=True
+    pending_tool_calls: list[Any]  # Tool calls waiting to be executed (passed from llm to tools node)
+    run_start_time: float  # Timestamp when the run started (for timing display)
+    step_start_time: float  # Timestamp when current step started (for timing display)
+
+
 class Agent:
-    """Single agent with basic tools and MCP support."""
+    """Single agent with basic tools and MCP support.
+
+    Runtime constraints:
+    - One Agent instance is bound to a single asyncio event loop on first ``run()``.
+    - Reusing the same instance across different loops is not supported; create a new instance.
+    - For future subagents, prefer isolated Agent instances per subagent and scheduler-level
+        concurrency limits instead of sharing one Agent instance.
+    """
 
     def __init__(
         self,
@@ -74,6 +105,8 @@ class Agent:
 
         # Initialize message history
         self.messages: list[Message] = [Message(role="system", content=system_prompt)]
+        self._bound_loop: asyncio.AbstractEventLoop | None = None
+        self._run_lock: asyncio.Lock | None = None
 
         # Initialize logger
         self.logger = AgentLogger()
@@ -82,6 +115,322 @@ class Agent:
         self.api_total_tokens: int = 0
         # Flag to skip token check right after summary (avoid consecutive triggers)
         self._skip_next_token_check: bool = False
+
+        # Build LangGraph workflow once and reuse across runs
+        self._graph = self._build_graph()
+
+    def _build_graph(self):
+        """Build single-agent LangGraph workflow.
+
+        Graph topology:
+        START -> summarize -> llm -> (END | tools) -> (END | summarize)
+        """
+        try:
+            graph = StateGraph(AgentGraphState)
+            graph.add_node("summarize", self._graph_summarize_node)
+            graph.add_node("llm", self._graph_llm_node)
+            graph.add_node("tools", self._graph_tools_node)
+
+            graph.add_edge(START, "summarize")
+            graph.add_edge("summarize", "llm")
+            graph.add_conditional_edges("llm", self._route_after_llm, {"tools": "tools", END: END})
+            graph.add_conditional_edges("tools", self._route_after_tools, {"summarize": "summarize", END: END})
+
+            return graph.compile()
+        except Exception as e:
+            raise RuntimeError(f"Failed to build agent workflow graph: {e}") from e
+
+    @contextmanager
+    def _scoped_messages(self, messages: list[Message]):
+        """Temporarily bind `self.messages` to node-local messages and restore afterwards."""
+        original_messages = self.messages
+        self.messages = messages
+        try:
+            yield
+        finally:
+            self.messages = original_messages
+
+    def _route_after_llm(self, state: AgentGraphState) -> str:
+        """Route after LLM node based on completion state."""
+        return END if state.get("done", False) else "tools"
+
+    def _route_after_tools(self, state: AgentGraphState) -> str:
+        """Route after tools node based on completion state."""
+        return END if state.get("done", False) else "summarize"
+
+    async def _graph_summarize_node(self, state: AgentGraphState) -> AgentGraphState:
+        """Summarization node to keep context within token budget."""
+        if "run_start_time" not in state:
+            raise RuntimeError("Invalid graph state: missing required field 'run_start_time'")
+
+        working_messages = state["messages"].copy()
+        with self._scoped_messages(working_messages):
+            await self._summarize_messages()
+            return {
+                "messages": self.messages.copy(),
+                "step": state.get("step", 0),
+                "done": state.get("done", False),
+                "final_response": state.get("final_response", ""),
+                "run_start_time": state["run_start_time"],
+            }
+
+    async def _graph_llm_node(self, state: AgentGraphState) -> AgentGraphState:
+        """LLM reasoning node: produce assistant output and optional tool calls."""
+        working_messages = state["messages"].copy()
+
+        with self._scoped_messages(working_messages):
+            step = state.get("step", 0)
+            if "run_start_time" not in state:
+                raise RuntimeError("Invalid graph state: missing required field 'run_start_time' in llm node")
+            run_start_time = state["run_start_time"]
+
+            if step >= self.max_steps:
+                error_msg = f"Task couldn't be completed after {self.max_steps} steps."
+                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
+                return {
+                    "messages": self.messages.copy(),
+                    "step": step,
+                    "done": True,
+                    "final_response": error_msg,
+                    "run_start_time": run_start_time,
+                }
+
+            if self._check_cancelled():
+                self._cleanup_incomplete_messages()
+                cancel_msg = "Task cancelled by user."
+                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                return {
+                    "messages": self.messages.copy(),
+                    "step": step,
+                    "done": True,
+                    "final_response": cancel_msg,
+                    "run_start_time": run_start_time,
+                }
+
+            step_start_time = perf_counter()
+
+            BOX_WIDTH = 58
+            step_text = f"{Colors.BOLD}{Colors.BRIGHT_CYAN}💭 Step {step + 1}/{self.max_steps}{Colors.RESET}"
+            step_display_width = calculate_display_width(step_text)
+            padding = max(0, BOX_WIDTH - 1 - step_display_width)
+
+            print(f"\n{Colors.DIM}╭{'─' * BOX_WIDTH}╮{Colors.RESET}")
+            print(f"{Colors.DIM}│{Colors.RESET} {step_text}{' ' * padding}{Colors.DIM}│{Colors.RESET}")
+            print(f"{Colors.DIM}╰{'─' * BOX_WIDTH}╯{Colors.RESET}")
+
+            tool_list = list(self.tools.values())
+            self.logger.log_request(messages=self.messages, tools=tool_list)
+
+            try:
+                response = await self.llm.generate(messages=self.messages, tools=tool_list)
+            except Exception as e:
+                if isinstance(e, RetryExhaustedError):
+                    error_msg = f"LLM call failed after {e.attempts} retries\nLast error: {str(e.last_exception)}"
+                    print(f"\n{Colors.BRIGHT_RED}❌ Retry failed:{Colors.RESET} {error_msg}")
+                else:
+                    error_msg = f"LLM call failed: {str(e)}"
+                    print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
+
+                return {
+                    "messages": self.messages.copy(),
+                    "step": step,
+                    "done": True,
+                    "final_response": error_msg,
+                    "run_start_time": run_start_time,
+                }
+
+            if response.usage:
+                self.api_total_tokens = response.usage.total_tokens
+
+            self.logger.log_response(
+                content=response.content,
+                thinking=response.thinking,
+                tool_calls=response.tool_calls,
+                finish_reason=response.finish_reason,
+            )
+
+            assistant_msg = Message(
+                role="assistant",
+                content=response.content,
+                thinking=response.thinking,
+                thinking_blocks=response.thinking_blocks,
+                tool_calls=response.tool_calls,
+            )
+            self.messages.append(assistant_msg)
+
+            if response.thinking:
+                print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
+                print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
+
+            if response.content:
+                print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
+                print(f"{response.content}")
+
+            if not response.tool_calls:
+                step_elapsed = perf_counter() - step_start_time
+                total_elapsed = perf_counter() - run_start_time
+                print(
+                    f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}"
+                )
+                return {
+                    "messages": self.messages.copy(),
+                    "step": step,
+                    "done": True,
+                    "final_response": response.content,
+                    "run_start_time": run_start_time,
+                    "step_start_time": step_start_time,
+                }
+
+            if self._check_cancelled():
+                self._cleanup_incomplete_messages()
+                cancel_msg = "Task cancelled by user."
+                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                return {
+                    "messages": self.messages.copy(),
+                    "step": step,
+                    "done": True,
+                    "final_response": cancel_msg,
+                    "run_start_time": run_start_time,
+                    "step_start_time": step_start_time,
+                }
+
+            return {
+                "messages": self.messages.copy(),
+                "step": step,
+                "done": False,
+                "final_response": "",
+                "pending_tool_calls": response.tool_calls,
+                "run_start_time": run_start_time,
+                "step_start_time": step_start_time,
+            }
+
+    async def _graph_tools_node(self, state: AgentGraphState) -> AgentGraphState:
+        """Tool execution node: execute requested tools and append tool messages."""
+        working_messages = state["messages"].copy()
+
+        with self._scoped_messages(working_messages):
+            step = state.get("step", 0)
+            if "run_start_time" not in state:
+                raise RuntimeError("Invalid graph state: missing required field 'run_start_time' in tools node")
+            if "step_start_time" not in state:
+                raise RuntimeError("Invalid graph state: missing required field 'step_start_time' in tools node")
+            run_start_time = state["run_start_time"]
+            step_start_time = state["step_start_time"]
+            pending_tool_calls = state.get("pending_tool_calls") or []
+
+            if self._check_cancelled():
+                self._cleanup_incomplete_messages()
+                cancel_msg = "Task cancelled by user."
+                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                return {
+                    "messages": self.messages.copy(),
+                    "step": step,
+                    "done": True,
+                    "final_response": cancel_msg,
+                    "run_start_time": run_start_time,
+                }
+
+            for tool_call in pending_tool_calls:
+                tool_call_id = tool_call.id
+                function_name = tool_call.function.name
+                arguments = tool_call.function.arguments
+
+                print(
+                    f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}"
+                )
+                print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
+
+                truncated_args: dict[str, Any] = {}
+                for key, value in arguments.items():
+                    value_str = str(value)
+                    if len(value_str) > 200:
+                        truncated_args[key] = value_str[:200] + "..."
+                    else:
+                        truncated_args[key] = value
+                args_json = json.dumps(truncated_args, indent=2, ensure_ascii=False)
+                for line in args_json.split("\n"):
+                    print(f"   {Colors.DIM}{line}{Colors.RESET}")
+
+                if function_name not in self.tools:
+                    result = ToolResult(
+                        success=False,
+                        content="",
+                        error=f"Unknown tool: {function_name}",
+                    )
+                else:
+                    try:
+                        tool = self.tools[function_name]
+                        result = await tool.execute(**arguments)
+                    except Exception as e:
+                        error_detail = f"{type(e).__name__}: {str(e)}"
+                        error_trace = traceback.format_exc()
+                        result = ToolResult(
+                            success=False,
+                            content="",
+                            error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
+                        )
+
+                self.logger.log_tool_result(
+                    tool_name=function_name,
+                    arguments=arguments,
+                    result_success=result.success,
+                    result_content=result.content if result.success else None,
+                    result_error=result.error if not result.success else None,
+                )
+
+                if result.success:
+                    result_text = result.content
+                    if len(result_text) > 300:
+                        result_text = result_text[:300] + "..."
+                    print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
+                else:
+                    print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{result.error}{Colors.RESET}")
+
+                tool_msg = Message(
+                    role="tool",
+                    content=result.content if result.success else f"Error: {result.error}",
+                    tool_call_id=tool_call_id,
+                    name=function_name,
+                )
+                self.messages.append(tool_msg)
+
+                if self._check_cancelled():
+                    self._cleanup_incomplete_messages()
+                    cancel_msg = "Task cancelled by user."
+                    print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
+                    return {
+                        "messages": self.messages.copy(),
+                        "step": step,
+                        "done": True,
+                        "final_response": cancel_msg,
+                        "run_start_time": run_start_time,
+                    }
+
+            step_elapsed = perf_counter() - step_start_time
+            total_elapsed = perf_counter() - run_start_time
+            print(
+                f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}"
+            )
+
+            next_step = step + 1
+            if next_step >= self.max_steps:
+                error_msg = f"Task couldn't be completed after {self.max_steps} steps."
+                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
+                return {
+                    "messages": self.messages.copy(),
+                    "step": next_step,
+                    "done": True,
+                    "final_response": error_msg,
+                    "run_start_time": run_start_time,
+                }
+
+            return {
+                "messages": self.messages.copy(),
+                "step": next_step,
+                "done": False,
+                "final_response": "",
+                "run_start_time": run_start_time,
+            }
 
     def add_user_message(self, content: str):
         """Add a user message to history."""
@@ -329,195 +678,63 @@ Requirements:
         Returns:
             The final response content, or error message (including cancellation message).
         """
-        # Set cancellation event (can also be set via self.cancel_event before calling run())
-        if cancel_event is not None:
-            self.cancel_event = cancel_event
-
-        # Start new run, initialize log file
-        self.logger.start_new_run()
-        print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
-
-        step = 0
-        run_start_time = perf_counter()
-
-        while step < self.max_steps:
-            # Check for cancellation at start of each step
-            if self._check_cancelled():
-                self._cleanup_incomplete_messages()
-                cancel_msg = "Task cancelled by user."
-                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
-                return cancel_msg
-
-            step_start_time = perf_counter()
-            # Check and summarize message history to prevent context overflow
-            await self._summarize_messages()
-
-            # Step header with proper width calculation
-            BOX_WIDTH = 58
-            step_text = f"{Colors.BOLD}{Colors.BRIGHT_CYAN}💭 Step {step + 1}/{self.max_steps}{Colors.RESET}"
-            step_display_width = calculate_display_width(step_text)
-            padding = max(0, BOX_WIDTH - 1 - step_display_width)  # -1 for leading space
-
-            print(f"\n{Colors.DIM}╭{'─' * BOX_WIDTH}╮{Colors.RESET}")
-            print(f"{Colors.DIM}│{Colors.RESET} {step_text}{' ' * padding}{Colors.DIM}│{Colors.RESET}")
-            print(f"{Colors.DIM}╰{'─' * BOX_WIDTH}╯{Colors.RESET}")
-
-            # Get tool list for LLM call
-            tool_list = list(self.tools.values())
-
-            # Log LLM request and call LLM with Tool objects directly
-            self.logger.log_request(messages=self.messages, tools=tool_list)
-
-            try:
-                response = await self.llm.generate(messages=self.messages, tools=tool_list)
-            except Exception as e:
-                # Check if it's a retry exhausted error
-                from .retry import RetryExhaustedError
-
-                if isinstance(e, RetryExhaustedError):
-                    error_msg = f"LLM call failed after {e.attempts} retries\nLast error: {str(e.last_exception)}"
-                    print(f"\n{Colors.BRIGHT_RED}❌ Retry failed:{Colors.RESET} {error_msg}")
-                else:
-                    error_msg = f"LLM call failed: {str(e)}"
-                    print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
-                return error_msg
-
-            # Accumulate API reported token usage
-            if response.usage:
-                self.api_total_tokens = response.usage.total_tokens
-
-            # Log LLM response
-            self.logger.log_response(
-                content=response.content,
-                thinking=response.thinking,
-                tool_calls=response.tool_calls,
-                finish_reason=response.finish_reason,
+        # This Agent instance is loop-affine: bind on first run and reject cross-loop reuse.
+        # For future subagents, follow deer-flow style: create isolated Agent instances per
+        # subagent and control concurrency at the scheduler layer instead of sharing one instance.
+        current_loop = asyncio.get_running_loop()
+        if self._bound_loop is None:
+            self._bound_loop = current_loop
+        elif self._bound_loop is not current_loop:
+            raise RuntimeError(
+                "Agent instances can only be reused within the same event loop. "
+                "Create a new Agent instance for a different loop."
             )
 
-            # Add assistant message
-            assistant_msg = Message(
-                role="assistant",
-                content=response.content,
-                thinking=response.thinking,
-                thinking_blocks=response.thinking_blocks,
-                tool_calls=response.tool_calls,
+        if self._run_lock is None:
+            self._run_lock = asyncio.Lock()
+
+        async with self._run_lock:
+            # Set cancellation event (can also be set via self.cancel_event before calling run())
+            if cancel_event is not None:
+                self.cancel_event = cancel_event
+
+            # Start new run, initialize log file
+            self.logger.start_new_run()
+            print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
+
+            initial_state: AgentGraphState = {
+                "messages": self.messages.copy(),
+                "step": 0,
+                "done": False,
+                "final_response": "",
+                "run_start_time": perf_counter(),
+            }
+
+            # Per step, the theoretical traversal is ~4 transitions
+            # (summarize -> llm -> tools -> summarize). We use 6 as a safety margin
+            # to absorb extra transitions from conditional routing and edge cases,
+            # while keeping a floor of 100 for short runs.
+            TRANSITIONS_PER_STEP_MARGIN = 6
+            MIN_RECURSION_LIMIT = 100
+            recursion_limit = max(MIN_RECURSION_LIMIT, self.max_steps * TRANSITIONS_PER_STEP_MARGIN)
+            final_state = await self._graph.ainvoke(
+                initial_state,
+                config={"recursion_limit": recursion_limit},
             )
-            self.messages.append(assistant_msg)
 
-            # Print thinking if present
-            if response.thinking:
-                print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
-                print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
+            self.messages = final_state.get("messages", self.messages)
 
-            # Print assistant response
-            if response.content:
-                print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
-                print(f"{response.content}")
+            final_response = final_state.get("final_response", "")
+            if final_response:
+                return final_response
 
-            # Check if task is complete (no tool calls)
-            if not response.tool_calls:
-                step_elapsed = perf_counter() - step_start_time
-                total_elapsed = perf_counter() - run_start_time
-                print(f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
-                return response.content
+            # Defensive fallback (should rarely happen)
+            if final_state.get("done", False):
+                return "Task completed."
 
-            # Check for cancellation before executing tools
-            if self._check_cancelled():
-                self._cleanup_incomplete_messages()
-                cancel_msg = "Task cancelled by user."
-                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
-                return cancel_msg
-
-            # Execute tool calls
-            for tool_call in response.tool_calls:
-                tool_call_id = tool_call.id
-                function_name = tool_call.function.name
-                arguments = tool_call.function.arguments
-
-                # Tool call header
-                print(f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}")
-
-                # Arguments (formatted display)
-                print(f"{Colors.DIM}   Arguments:{Colors.RESET}")
-                # Truncate each argument value to avoid overly long output
-                truncated_args = {}
-                for key, value in arguments.items():
-                    value_str = str(value)
-                    if len(value_str) > 200:
-                        truncated_args[key] = value_str[:200] + "..."
-                    else:
-                        truncated_args[key] = value
-                args_json = json.dumps(truncated_args, indent=2, ensure_ascii=False)
-                for line in args_json.split("\n"):
-                    print(f"   {Colors.DIM}{line}{Colors.RESET}")
-
-                # Execute tool
-                if function_name not in self.tools:
-                    result = ToolResult(
-                        success=False,
-                        content="",
-                        error=f"Unknown tool: {function_name}",
-                    )
-                else:
-                    try:
-                        tool = self.tools[function_name]
-                        result = await tool.execute(**arguments)
-                    except Exception as e:
-                        # Catch all exceptions during tool execution, convert to failed ToolResult
-                        import traceback
-
-                        error_detail = f"{type(e).__name__}: {str(e)}"
-                        error_trace = traceback.format_exc()
-                        result = ToolResult(
-                            success=False,
-                            content="",
-                            error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
-                        )
-
-                # Log tool execution result
-                self.logger.log_tool_result(
-                    tool_name=function_name,
-                    arguments=arguments,
-                    result_success=result.success,
-                    result_content=result.content if result.success else None,
-                    result_error=result.error if not result.success else None,
-                )
-
-                # Print result
-                if result.success:
-                    result_text = result.content
-                    if len(result_text) > 300:
-                        result_text = result_text[:300] + f"{Colors.DIM}...{Colors.RESET}"
-                    print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
-                else:
-                    print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{result.error}{Colors.RESET}")
-
-                # Add tool result message
-                tool_msg = Message(
-                    role="tool",
-                    content=result.content if result.success else f"Error: {result.error}",
-                    tool_call_id=tool_call_id,
-                    name=function_name,
-                )
-                self.messages.append(tool_msg)
-
-                # Check for cancellation after each tool execution
-                if self._check_cancelled():
-                    self._cleanup_incomplete_messages()
-                    cancel_msg = "Task cancelled by user."
-                    print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
-                    return cancel_msg
-
-            step_elapsed = perf_counter() - step_start_time
-            total_elapsed = perf_counter() - run_start_time
-            print(f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
-
-            step += 1
-
-        # Max steps reached
-        error_msg = f"Task couldn't be completed after {self.max_steps} steps."
-        print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
-        return error_msg
+            error_msg = f"Task couldn't be completed after {self.max_steps} steps."
+            print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
+            return error_msg
 
     def get_history(self) -> list[Message]:
         """Get message history."""
