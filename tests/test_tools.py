@@ -73,6 +73,35 @@ async def test_edit_tool():
 
 
 @pytest.mark.asyncio
+async def test_edit_tool_requires_unique_match():
+    """Edit tool should fail when old_str appears more than once."""
+    print("\n=== Testing EditTool Unique Match Constraint ===")
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+        f.write("foo bar foo")
+        temp_path = f.name
+
+    try:
+        tool = EditTool()
+        result = await tool.execute(
+            path=temp_path,
+            old_str="foo",
+            new_str="baz",
+        )
+
+        assert not result.success, "Edit should fail when match is not unique"
+        assert result.error is not None
+        assert "requires a unique match" in result.error
+
+        # Ensure file content unchanged on failure
+        content = Path(temp_path).read_text()
+        assert content == "foo bar foo"
+        print("✅ EditTool unique match constraint test passed")
+    finally:
+        Path(temp_path).unlink()
+
+
+@pytest.mark.asyncio
 async def test_bash_tool():
     """Test bash command tool."""
     print("\n=== Testing BashTool ===")
@@ -100,6 +129,7 @@ async def main():
     await test_read_tool()
     await test_write_tool()
     await test_edit_tool()
+    await test_edit_tool_requires_unique_match()
     await test_bash_tool()
 
     print("\n" + "=" * 80)

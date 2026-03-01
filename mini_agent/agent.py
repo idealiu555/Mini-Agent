@@ -1,12 +1,13 @@
 """Core Agent implementation."""
 
 import asyncio
+import inspect
 import json
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Optional, TypedDict
+from typing import Any, Awaitable, Callable, Optional, TypedDict
 
 import tiktoken
 from langgraph.graph import END, START, StateGraph
@@ -17,6 +18,9 @@ from .retry import RetryExhaustedError
 from .schema import Message
 from .tools.base import Tool, ToolResult
 from .utils import calculate_display_width
+
+
+EventHandler = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 
 
 # ANSI color codes
@@ -84,6 +88,7 @@ class Agent:
         max_steps: int = 50,
         workspace_dir: str = "./workspace",
         token_limit: int = 80000,  # Summary triggered when tokens exceed this value
+        event_handler: EventHandler | None = None,
     ):
         self.llm = llm_client
         self.tools = {tool.name: tool for tool in tools}
@@ -92,6 +97,7 @@ class Agent:
         self.workspace_dir = Path(workspace_dir)
         # Cancellation event for interrupting agent execution (set externally, e.g., by Esc key)
         self.cancel_event: Optional[asyncio.Event] = None
+        self.event_handler = event_handler
 
         # Ensure workspace exists
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -118,6 +124,23 @@ class Agent:
 
         # Build LangGraph workflow once and reuse across runs
         self._graph = self._build_graph()
+
+    async def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Emit runtime event if handler is configured.
+
+        Supports both sync handlers (return ``None``) and async handlers
+        (return awaitable). Handler absence is represented by
+        ``self.event_handler is None``.
+        """
+        if self.event_handler is None:
+            return
+        try:
+            result = self.event_handler(event_type, payload)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            # Never let event emission break the main execution path
+            pass
 
     def _build_graph(self):
         """Build single-agent LangGraph workflow.
@@ -261,10 +284,24 @@ class Agent:
             if response.thinking:
                 print(f"\n{Colors.BOLD}{Colors.MAGENTA}🧠 Thinking:{Colors.RESET}")
                 print(f"{Colors.DIM}{response.thinking}{Colors.RESET}")
+                await self._emit_event(
+                    "assistant_thinking",
+                    {
+                        "thinking": response.thinking,
+                        "step": step,
+                    },
+                )
 
             if response.content:
                 print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
                 print(f"{response.content}")
+                await self._emit_event(
+                    "assistant_message",
+                    {
+                        "content": response.content,
+                        "step": step,
+                    },
+                )
 
             if not response.tool_calls:
                 step_elapsed = perf_counter() - step_start_time
@@ -335,6 +372,16 @@ class Agent:
                 function_name = tool_call.function.name
                 arguments = tool_call.function.arguments
 
+                await self._emit_event(
+                    "tool_call_start",
+                    {
+                        "tool_call_id": tool_call_id,
+                        "tool_name": function_name,
+                        "arguments": arguments,
+                        "step": step,
+                    },
+                )
+
                 print(
                     f"\n{Colors.BRIGHT_YELLOW}🔧 Tool Call:{Colors.RESET} {Colors.BOLD}{Colors.CYAN}{function_name}{Colors.RESET}"
                 )
@@ -385,6 +432,19 @@ class Agent:
                     print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result_text}")
                 else:
                     print(f"{Colors.BRIGHT_RED}✗ Error:{Colors.RESET} {Colors.RED}{result.error}{Colors.RESET}")
+
+                await self._emit_event(
+                    "tool_call_result",
+                    {
+                        "tool_call_id": tool_call_id,
+                        "tool_name": function_name,
+                        "arguments": arguments,
+                        "success": result.success,
+                        "content": result.content,
+                        "error": result.error,
+                        "step": step,
+                    },
+                )
 
                 tool_msg = Message(
                     role="tool",

@@ -270,14 +270,25 @@ class EditTool(Tool):
 
             content = file_path.read_text(encoding="utf-8")
 
-            if old_str not in content:
+            match_count = content.count(old_str)
+            if match_count == 0:
                 return ToolResult(
                     success=False,
                     content="",
                     error=f"Text not found in file: {old_str}",
                 )
 
-            new_content = content.replace(old_str, new_str)
+            if match_count > 1:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=(
+                        f"Text appears {match_count} times; edit_file requires a unique match. "
+                        "Please provide more specific old_str."
+                    ),
+                )
+
+            new_content = content.replace(old_str, new_str, 1)
             file_path.write_text(new_content, encoding="utf-8")
 
             return ToolResult(success=True, content=f"Successfully edited {file_path}")

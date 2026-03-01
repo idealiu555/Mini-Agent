@@ -36,7 +36,6 @@ from mini_agent.cli import add_workspace_tools, initialize_base_tools
 from mini_agent.config import Config
 from mini_agent.llm import LLMClient
 from mini_agent.retry import RetryConfig as RetryConfigBase
-from mini_agent.schema import Message
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +64,7 @@ except Exception:  # pragma: no cover - defensive
 class SessionState:
     agent: Agent
     cancelled: bool = False
+    cancel_event: asyncio.Event | None = None
 
 
 class MiniMaxACPAgent:
@@ -85,6 +85,47 @@ class MiniMaxACPAgent:
         self._system_prompt = system_prompt
         self._sessions: dict[str, SessionState] = {}
 
+    async def _handle_agent_event(self, session_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        """Bridge Agent runtime events to ACP protocol updates."""
+        if event_type == "assistant_thinking":
+            thinking = payload.get("thinking")
+            if thinking:
+                await self._send(session_id, update_agent_thought(text_block(str(thinking))))
+            return
+
+        if event_type == "assistant_message":
+            content = payload.get("content")
+            if content:
+                await self._send(session_id, update_agent_message(text_block(str(content))))
+            return
+
+        if event_type == "tool_call_start":
+            tool_call_id = str(payload.get("tool_call_id", ""))
+            tool_name = str(payload.get("tool_name", "unknown"))
+            arguments = payload.get("arguments") or {}
+            args_preview = ", ".join(f"{k}={repr(v)[:50]}" for k, v in list(arguments.items())[:2]) if isinstance(arguments, dict) else ""
+            label = f"🔧 {tool_name}({args_preview})" if args_preview else f"🔧 {tool_name}()"
+            await self._send(session_id, start_tool_call(tool_call_id, label, kind="execute", raw_input=arguments))
+            return
+
+        if event_type == "tool_call_result":
+            tool_call_id = str(payload.get("tool_call_id", ""))
+            success = bool(payload.get("success"))
+            content = payload.get("content", "")
+            error = payload.get("error")
+            status = "completed" if success else "failed"
+            text = f"[OK] {content}" if success else f"[ERROR] {error or 'Tool execution failed'}"
+            await self._send(
+                session_id,
+                update_tool_call(
+                    tool_call_id,
+                    status=status,
+                    content=[tool_content(text_block(text))],
+                    raw_output=text,
+                ),
+            )
+            return
+
     async def initialize(self, params: InitializeRequest) -> InitializeResponse:  # noqa: ARG002
         return InitializeResponse(
             protocolVersion=PROTOCOL_VERSION,
@@ -99,7 +140,14 @@ class MiniMaxACPAgent:
             workspace = workspace.resolve()
         tools = list(self._base_tools)
         add_workspace_tools(tools, self._config, workspace)
-        agent = Agent(llm_client=self._llm, system_prompt=self._system_prompt, tools=tools, max_steps=self._config.agent.max_steps, workspace_dir=str(workspace))
+        agent = Agent(
+            llm_client=self._llm,
+            system_prompt=self._system_prompt,
+            tools=tools,
+            max_steps=self._config.agent.max_steps,
+            workspace_dir=str(workspace),
+            event_handler=lambda event_type, payload: self._handle_agent_event(session_id, event_type, payload),
+        )
         self._sessions[session_id] = SessionState(agent=agent)
         return NewSessionResponse(sessionId=session_id)
 
@@ -109,66 +157,45 @@ class MiniMaxACPAgent:
             logger.warning(f"Session '{params.sessionId}' not found")
             return PromptResponse(stopReason="refusal")
         state.cancelled = False
+        state.cancel_event = asyncio.Event()
         user_text = "\n".join(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "") for block in params.prompt)
-        state.agent.messages.append(Message(role="user", content=user_text))
-        stop_reason = await self._run_turn(state, params.sessionId)
+        state.agent.add_user_message(user_text)
+
+        result = await state.agent.run(cancel_event=state.cancel_event)
+        if state.cancel_event.is_set() or self._is_cancelled_result(result):
+            stop_reason = "cancelled"
+        elif self._is_max_turn_result(result):
+            stop_reason = "max_turn_requests"
+        elif self._is_llm_error_result(result):
+            await self._send(params.sessionId, update_agent_message(text_block(f"Error: {result}")))
+            stop_reason = "refusal"
+        else:
+            stop_reason = "end_turn"
+
+        state.cancel_event = None
         return PromptResponse(stopReason=stop_reason)
 
     async def cancel(self, params: CancelNotification) -> None:
         state = self._sessions.get(params.sessionId)
         if state:
             state.cancelled = True
-
-    async def _run_turn(self, state: SessionState, session_id: str) -> str:
-        agent = state.agent
-        for _ in range(agent.max_steps):
-            if state.cancelled:
-                return "cancelled"
-            tool_schemas = [tool.to_schema() for tool in agent.tools.values()]
-            try:
-                response = await agent.llm.generate(messages=agent.messages, tools=tool_schemas)
-            except Exception as exc:
-                logger.exception("LLM error")
-                await self._send(session_id, update_agent_message(text_block(f"Error: {exc}")))
-                return "refusal"
-            if response.thinking:
-                await self._send(session_id, update_agent_thought(text_block(response.thinking)))
-            if response.content:
-                await self._send(session_id, update_agent_message(text_block(response.content)))
-            agent.messages.append(
-                Message(
-                    role="assistant",
-                    content=response.content,
-                    thinking=response.thinking,
-                    thinking_blocks=response.thinking_blocks,
-                    tool_calls=response.tool_calls,
-                )
-            )
-            if not response.tool_calls:
-                return "end_turn"
-            for call in response.tool_calls:
-                name, args = call.function.name, call.function.arguments
-                # Show tool name with key arguments for better visibility
-                args_preview = ", ".join(f"{k}={repr(v)[:50]}" for k, v in list(args.items())[:2]) if isinstance(args, dict) else ""
-                label = f"🔧 {name}({args_preview})" if args_preview else f"🔧 {name}()"
-                await self._send(session_id, start_tool_call(call.id, label, kind="execute", raw_input=args))
-                tool = agent.tools.get(name)
-                if not tool:
-                    text, status = f"[ERROR] Unknown tool: {name}", "failed"
-                else:
-                    try:
-                        result = await tool.execute(**args)
-                        status = "completed" if result.success else "failed"
-                        prefix = "[OK]" if result.success else "[ERROR]"
-                        text = f"{prefix} {result.content if result.success else result.error or 'Tool execution failed'}"
-                    except Exception as exc:
-                        status, text = "failed", f"[ERROR] Tool error: {exc}"
-                await self._send(session_id, update_tool_call(call.id, status=status, content=[tool_content(text_block(text))], raw_output=text))
-                agent.messages.append(Message(role="tool", content=text, tool_call_id=call.id, name=name))
-        return "max_turn_requests"
+            if state.cancel_event is not None:
+                state.cancel_event.set()
 
     async def _send(self, session_id: str, update: Any) -> None:
         await self._conn.sessionUpdate(session_notification(session_id, update))
+
+    @staticmethod
+    def _is_cancelled_result(result: str) -> bool:
+        return result.strip() == "Task cancelled by user."
+
+    @staticmethod
+    def _is_max_turn_result(result: str) -> bool:
+        return result.startswith("Task couldn't be completed after ")
+
+    @staticmethod
+    def _is_llm_error_result(result: str) -> bool:
+        return result.startswith("LLM call failed")
 
 
 async def run_acp_server(config: Config | None = None) -> None:
