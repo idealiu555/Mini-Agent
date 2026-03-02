@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from mini_agent.tools.bash_tool import BackgroundShellManager, BashKillTool, BashOutputTool, BashTool
+from mini_agent.tools.bash_tool import BackgroundShell, BackgroundShellManager, BashKillTool, BashOutputTool, BashTool
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +70,7 @@ async def test_command_timeout():
 
     assert not result.success
     assert "timed out" in result.error.lower()
-    assert result.exit_code == -1
+    assert result.exit_code != 0
     print(f"Timeout error: {result.error}")
 
 
@@ -280,3 +280,56 @@ async def test_timeout_validation():
     result = await bash_tool.execute(command="echo 'test'", timeout=0)
     assert result.success
     print("Timeout < 1 handled correctly")
+
+
+@pytest.mark.asyncio
+async def test_background_shell_terminate_waits_after_forced_kill(monkeypatch):
+    """BackgroundShell.terminate should wait again after force-killing."""
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.kill_called = False
+            self.wait_calls = 0
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            self.kill_called = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.wait_calls += 1
+            return self.returncode
+
+    process = FakeProcess()
+    shell = BackgroundShell(
+        bash_id="fake1234",
+        command="echo test",
+        process=process,
+        start_time=0.0,
+    )
+
+    wait_for_calls = {"count": 0}
+
+    async def fake_wait_for(awaitable, _timeout=None, **kwargs):
+        if "timeout" in kwargs:
+            _timeout = kwargs["timeout"]
+        wait_for_calls["count"] += 1
+        if wait_for_calls["count"] == 1:
+            # Close coroutine to avoid unawaited warnings.
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise asyncio.TimeoutError()
+        return await awaitable
+
+    monkeypatch.setattr("mini_agent.tools.bash_tool.asyncio.wait_for", fake_wait_for)
+
+    await shell.terminate()
+
+    assert process.kill_called
+    assert wait_for_calls["count"] == 2
+    assert process.wait_calls == 1
+    assert shell.exit_code == -9

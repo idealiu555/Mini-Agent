@@ -59,3 +59,33 @@ def test_parse_response_preserves_replayable_reasoning_blocks():
     assert parsed.thinking == "reason"
     assert parsed.thinking_blocks == [{"type": "reasoning", "text": "reason", "signature": "sig-2"}]
     assert parsed.content == "answer"
+
+
+def test_parse_response_tolerates_malformed_tool_arguments():
+    """Parser should not crash when tool arguments are malformed JSON."""
+    client = OpenAIClient(api_key="test-key", api_base="https://example.com/v1", model="test-model")
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="",
+                    reasoning_details=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="tc-1",
+                            function=SimpleNamespace(
+                                name="echo",
+                                arguments='{"incomplete":',
+                            ),
+                        )
+                    ],
+                )
+            )
+        ],
+        usage=None,
+    )
+
+    parsed = client._parse_response(response)
+    assert parsed.tool_calls is not None
+    assert parsed.tool_calls[0].function.arguments == {"_raw_arguments": '{"incomplete":'}

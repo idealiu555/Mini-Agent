@@ -101,8 +101,12 @@ class BackgroundShell:
                 await asyncio.wait_for(self.process.wait(), timeout=5)
             except asyncio.TimeoutError:
                 self.process.kill()
+                try:
+                    await asyncio.wait_for(self.process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
         self.status = "terminated"
-        self.exit_code = self.process.returncode
+        self.exit_code = self.process.returncode if self.process.returncode is not None else -1
 
 
 class BackgroundShellManager:
@@ -427,13 +431,17 @@ Examples:
                     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
                 except asyncio.TimeoutError:
                     process.kill()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        pass
                     error_msg = f"Command timed out after {timeout} seconds"
                     return BashOutputResult(
                         success=False,
                         error=error_msg,
                         stdout="",
                         stderr=error_msg,
-                        exit_code=-1,
+                        exit_code=process.returncode if process.returncode is not None else -1,
                     )
 
                 # Decode output

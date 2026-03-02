@@ -75,6 +75,18 @@ class Colors:
     BG_BLUE = "\033[44m"
 
 
+def resolve_provider(provider_name: str) -> LLMProvider:
+    """Convert provider string to LLMProvider enum with strict validation."""
+    normalized = provider_name.strip().lower()
+    try:
+        return LLMProvider(normalized)
+    except ValueError as exc:
+        supported_values = ", ".join(provider.value for provider in LLMProvider)
+        raise ValueError(
+            f"Unsupported provider: '{provider_name}'. Supported values: {supported_values}"
+        ) from exc
+
+
 def get_log_directory() -> Path:
     """Get the log directory path."""
     return Path.home() / ".mini-agent" / "log"
@@ -468,14 +480,16 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
 
 
 async def _quiet_cleanup():
-    """Clean up MCP connections, suppressing noisy asyncgen teardown tracebacks."""
+    """Clean up MCP connections during CLI shutdown, suppressing noisy asyncgen teardown tracebacks."""
     # Silence the asyncgen finalization noise that anyio/mcp emits when
-    # stdio_client's task group is torn down across tasks.  The handler is
+    # stdio_client's task group is torn down across tasks. The handler is
     # intentionally NOT restored: asyncgen finalization happens during
     # asyncio.run() shutdown (after run_agent returns), so restoring the
-    # handler here would still let the noise through.  Since this runs
-    # right before process exit, swallowing late exceptions is safe.
-    loop = asyncio.get_event_loop()
+    # handler here would still let the noise through. This helper is intended
+    # only for CLI shutdown (interactive and non-interactive) immediately
+    # before process exit; in that context, swallowing these late exceptions
+    # is acceptable.
+    loop = asyncio.get_running_loop()
     loop.set_exception_handler(lambda _loop, _ctx: None)
     try:
         await cleanup_mcp_connections()
@@ -556,7 +570,11 @@ async def run_agent(workspace_dir: Path, task: str = None):
         print(f"{Colors.DIM}   Retrying in {next_delay:.1f}s (attempt {attempt + 1})...{Colors.RESET}")
 
     # Convert provider string to LLMProvider enum
-    provider = LLMProvider.ANTHROPIC if config.llm.provider.lower() == "anthropic" else LLMProvider.OPENAI
+    try:
+        provider = resolve_provider(config.llm.provider)
+    except ValueError as e:
+        print(f"{Colors.RED}❌ Error: {e}{Colors.RESET}")
+        return
 
     llm_client = LLMClient(
         api_key=config.llm.api_key,

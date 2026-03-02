@@ -225,6 +225,29 @@ class OpenAIClient(LLMClientBase):
                 serialized["text"] = content
         return serialized
 
+    @staticmethod
+    def _parse_tool_arguments(arguments_raw: Any) -> dict[str, Any]:
+        """Parse tool call arguments into a dictionary.
+
+        OpenAI-compatible providers usually return `function.arguments` as JSON string.
+        Some providers may already return a dict. For malformed JSON, preserve the raw
+        payload under `_raw_arguments` to avoid hard-failing the whole turn.
+        """
+        if isinstance(arguments_raw, dict):
+            return arguments_raw
+
+        if not isinstance(arguments_raw, str):
+            return {"_raw_arguments": str(arguments_raw)}
+
+        try:
+            parsed = json.loads(arguments_raw)
+        except (TypeError, json.JSONDecodeError):
+            return {"_raw_arguments": arguments_raw}
+
+        if isinstance(parsed, dict):
+            return parsed
+        return {"_raw_arguments": arguments_raw}
+
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse OpenAI response into LLMResponse.
 
@@ -261,8 +284,7 @@ class OpenAIClient(LLMClientBase):
         tool_calls = []
         if message.tool_calls:
             for tool_call in message.tool_calls:
-                # Parse arguments from JSON string
-                arguments = json.loads(tool_call.function.arguments)
+                arguments = self._parse_tool_arguments(tool_call.function.arguments)
 
                 tool_calls.append(
                     ToolCall(
