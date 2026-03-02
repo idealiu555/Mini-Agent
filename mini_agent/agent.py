@@ -506,27 +506,43 @@ class Agent:
             return True
         return False
 
-    def _cleanup_incomplete_messages(self):
-        """Remove the incomplete assistant message and its partial tool results.
+    def _find_last_incomplete_tool_round_start(self) -> int | None:
+        """Find the assistant message index of the latest incomplete tool round.
 
-        This ensures message consistency after cancellation by removing
-        only the current step's incomplete messages, preserving completed steps.
+        A round is considered incomplete when an assistant message contains
+        tool_calls but the subsequent tool messages do not cover all tool_call IDs.
         """
-        # Find the index of the last assistant message
-        last_assistant_idx = -1
-        for i in range(len(self.messages) - 1, -1, -1):
-            if self.messages[i].role == "assistant":
-                last_assistant_idx = i
-                break
+        for idx in range(len(self.messages) - 1, -1, -1):
+            msg = self.messages[idx]
+            if msg.role != "assistant" or not msg.tool_calls:
+                continue
 
-        if last_assistant_idx == -1:
-            # No assistant message found, nothing to clean
+            expected_ids = {tool_call.id for tool_call in msg.tool_calls if tool_call.id}
+            if not expected_ids:
+                continue
+
+            returned_ids: set[str] = set()
+            for follow_msg in self.messages[idx + 1 :]:
+                if follow_msg.role == "tool" and follow_msg.tool_call_id in expected_ids:
+                    returned_ids.add(follow_msg.tool_call_id)
+
+            if expected_ids - returned_ids:
+                return idx
+
+            # The latest assistant with tool calls is complete; older rounds are ignored.
+            return None
+
+        return None
+
+    def _cleanup_incomplete_messages(self):
+        """Remove only incomplete assistant/tool round to keep history consistent."""
+        round_start_idx = self._find_last_incomplete_tool_round_start()
+        if round_start_idx is None:
             return
 
-        # Remove the last assistant message and all tool results after it
-        removed_count = len(self.messages) - last_assistant_idx
+        removed_count = len(self.messages) - round_start_idx
         if removed_count > 0:
-            self.messages = self.messages[:last_assistant_idx]
+            self.messages = self.messages[:round_start_idx]
             print(f"{Colors.DIM}   Cleaned up {removed_count} incomplete message(s){Colors.RESET}")
 
     def _estimate_tokens(self) -> int:
@@ -650,7 +666,7 @@ class Agent:
                 summary_text = await self._create_summary(execution_messages, i + 1)
                 if summary_text:
                     summary_message = Message(
-                        role="user",
+                        role="assistant",
                         content=f"[Assistant Execution Summary]\n\n{summary_text}",
                     )
                     new_messages.append(summary_message)

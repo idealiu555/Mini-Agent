@@ -7,11 +7,55 @@ This tool allows the agent to:
 """
 
 import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .base import Tool, ToolResult
+
+
+def _read_notes_from_file(memory_file: Path) -> list[dict[str, Any]]:
+    """Load note list from disk with strict validation."""
+    if not memory_file.exists():
+        return []
+
+    raw_content = memory_file.read_text(encoding="utf-8")
+    if not raw_content.strip():
+        return []
+
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid note storage format in {memory_file}: {exc.msg}") from exc
+
+    if not isinstance(parsed, list):
+        raise ValueError(f"Invalid note storage format in {memory_file}: expected a JSON array")
+
+    return parsed
+
+
+def _atomic_write_notes(memory_file: Path, notes: list[dict[str, Any]]) -> None:
+    """Persist notes atomically to avoid partial/corrupted writes."""
+    memory_file.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(notes, indent=2, ensure_ascii=False)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=memory_file.parent,
+        prefix=f".{memory_file.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_file:
+        temp_file.write(serialized)
+        temp_path = Path(temp_file.name)
+
+    try:
+        temp_path.replace(memory_file)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 class SessionNoteTool(Tool):
@@ -66,27 +110,19 @@ class SessionNoteTool(Tool):
             "required": ["content"],
         }
 
-    def _load_from_file(self) -> list:
+    def _load_from_file(self) -> list[dict[str, Any]]:
         """Load notes from file.
-        
+
         Returns empty list if file doesn't exist (lazy loading).
         """
-        if not self.memory_file.exists():
-            return []
-        
-        try:
-            return json.loads(self.memory_file.read_text())
-        except Exception:
-            return []
+        return _read_notes_from_file(self.memory_file)
 
-    def _save_to_file(self, notes: list):
+    def _save_to_file(self, notes: list[dict[str, Any]]):
         """Save notes to file.
-        
+
         Creates parent directory and file if they don't exist (lazy initialization).
         """
-        # Ensure parent directory exists when actually saving
-        self.memory_file.parent.mkdir(parents=True, exist_ok=True)
-        self.memory_file.write_text(json.dumps(notes, indent=2, ensure_ascii=False))
+        _atomic_write_notes(self.memory_file, notes)
 
     async def execute(self, content: str, category: str = "general") -> ToolResult:
         """Record a session note.
@@ -176,7 +212,7 @@ class RecallNoteTool(Tool):
                     content="No notes recorded yet.",
                 )
 
-            notes = json.loads(self.memory_file.read_text())
+            notes = _read_notes_from_file(self.memory_file)
 
             if not notes:
                 return ToolResult(

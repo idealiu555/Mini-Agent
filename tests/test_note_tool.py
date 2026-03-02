@@ -113,6 +113,46 @@ async def test_note_persistence():
         Path(note_file).unlink(missing_ok=True)
 
 
+@pytest.mark.asyncio
+async def test_record_note_fails_on_corrupted_json():
+    """record_note should fail fast on corrupted storage instead of silently overwriting data."""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+        note_file = f.name
+
+    corrupted_content = "{not-valid-json"
+    note_path = Path(note_file)
+    note_path.write_text(corrupted_content, encoding="utf-8")
+
+    try:
+        record_tool = SessionNoteTool(memory_file=note_file)
+        result = await record_tool.execute(content="new note", category="test")
+
+        assert not result.success
+        assert "Invalid note storage format" in (result.error or "")
+        assert note_path.read_text(encoding="utf-8") == corrupted_content
+    finally:
+        note_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_record_note_fails_when_storage_shape_is_invalid():
+    """record_note should reject JSON files that are valid JSON but not a list."""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
+        note_file = f.name
+
+    note_path = Path(note_file)
+    note_path.write_text('{"unexpected": "object"}', encoding="utf-8")
+
+    try:
+        record_tool = SessionNoteTool(memory_file=note_file)
+        result = await record_tool.execute(content="new note", category="test")
+
+        assert not result.success
+        assert "expected a JSON array" in (result.error or "")
+    finally:
+        note_path.unlink(missing_ok=True)
+
+
 async def main():
     """Run all session note tool tests."""
     print("=" * 80)

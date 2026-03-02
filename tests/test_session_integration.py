@@ -12,7 +12,7 @@ import pytest
 
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
-from mini_agent.schema import LLMResponse, Message
+from mini_agent.schema import FunctionCall, LLMResponse, Message, ToolCall
 from mini_agent.tools.bash_tool import BashTool
 from mini_agent.tools.file_tools import ReadTool, WriteTool
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
@@ -237,5 +237,112 @@ async def test_run_with_explicit_cancel_event_does_not_leak_cancel_state():
         normal_result = await agent.run()
         assert normal_result == "ok"
         assert llm_client.generate.await_count == 1
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_summarization_inserts_assistant_summary_message():
+    """Execution summaries should be assistant context, not user instructions."""
+    llm_client = MagicMock(spec=LLMClient)
+    llm_client.generate = AsyncMock(
+        return_value=LLMResponse(
+            content="Round summary",
+            finish_reason="stop",
+            tool_calls=None,
+        )
+    )
+
+    workspace_dir = Path("workspace") / "test_summary_role"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        agent = Agent(
+            llm_client=llm_client,
+            system_prompt="System",
+            tools=[],
+            workspace_dir=str(workspace_dir),
+            token_limit=10,
+        )
+
+        agent.add_user_message("Please inspect the project.")
+        agent.messages.append(Message(role="assistant", content="Inspection completed."))
+        agent.api_total_tokens = 999999
+
+        await agent._summarize_messages()
+
+        summary_messages = [
+            message
+            for message in agent.messages
+            if isinstance(message.content, str) and message.content.startswith("[Assistant Execution Summary]")
+        ]
+        assert summary_messages
+        assert all(message.role == "assistant" for message in summary_messages)
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
+def test_cleanup_incomplete_messages_keeps_completed_round(mock_llm_client):
+    """Cleanup should not delete completed rounds without dangling tool calls."""
+    workspace_dir = Path("workspace") / "test_cleanup_completed_round"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        agent = Agent(
+            llm_client=mock_llm_client,
+            system_prompt="System",
+            tools=[],
+            workspace_dir=str(workspace_dir),
+        )
+        agent.add_user_message("first task")
+        agent.messages.append(Message(role="assistant", content="completed"))
+
+        before_cleanup = agent.messages.copy()
+        agent._cleanup_incomplete_messages()
+
+        assert agent.messages == before_cleanup
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
+def test_cleanup_incomplete_messages_removes_partial_tool_round(mock_llm_client):
+    """Cleanup should remove only the latest assistant/tool round when tool results are incomplete."""
+    workspace_dir = Path("workspace") / "test_cleanup_partial_round"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        agent = Agent(
+            llm_client=mock_llm_client,
+            system_prompt="System",
+            tools=[],
+            workspace_dir=str(workspace_dir),
+        )
+        agent.add_user_message("task one")
+        agent.messages.append(Message(role="assistant", content="task one completed"))
+        agent.add_user_message("task two")
+
+        pending_tool_calls = [
+            ToolCall(
+                id="tc-1",
+                type="function",
+                function=FunctionCall(name="read_file", arguments={"path": "a.txt"}),
+            ),
+            ToolCall(
+                id="tc-2",
+                type="function",
+                function=FunctionCall(name="read_file", arguments={"path": "b.txt"}),
+            ),
+        ]
+        agent.messages.append(Message(role="assistant", content="", tool_calls=pending_tool_calls))
+        agent.messages.append(
+            Message(
+                role="tool",
+                content="partial result",
+                tool_call_id="tc-1",
+                name="read_file",
+            )
+        )
+
+        agent._cleanup_incomplete_messages()
+
+        assert [message.role for message in agent.messages] == ["system", "user", "assistant", "user"]
+        assert agent.messages[-1].content == "task two"
     finally:
         shutil.rmtree(workspace_dir, ignore_errors=True)
