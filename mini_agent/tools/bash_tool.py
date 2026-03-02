@@ -32,6 +32,9 @@ class BashOutputResult(ToolResult):
     @model_validator(mode="after")
     def format_content(self) -> "BashOutputResult":
         """Auto-format content from stdout and stderr if content is empty."""
+        if self.content:
+            return self
+
         output = ""
         if self.stdout:
             output += self.stdout

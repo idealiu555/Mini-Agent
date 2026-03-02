@@ -1,10 +1,13 @@
 """Tests for CLI helper behaviors."""
 
 import asyncio
+import shutil
+from pathlib import Path
 
 import pytest
 
-from mini_agent.cli import _quiet_cleanup, resolve_provider
+from mini_agent.cli import _quiet_cleanup, add_workspace_tools, resolve_provider
+from mini_agent.config import AgentConfig, Config, LLMConfig, ToolsConfig
 from mini_agent.schema import LLMProvider
 
 
@@ -42,3 +45,30 @@ async def test_quiet_cleanup_keeps_quiet_exception_handler(monkeypatch):
         assert current_handler is not original_handler
     finally:
         loop.set_exception_handler(None)
+
+
+def test_add_workspace_tools_loads_record_and_recall_note_tools():
+    """Workspace tools should include both note record and recall tools."""
+    config = Config(
+        llm=LLMConfig(api_key="test-key"),
+        agent=AgentConfig(),
+        tools=ToolsConfig(
+            enable_file_tools=False,
+            enable_bash=False,
+            enable_note=True,
+            enable_skills=False,
+            enable_mcp=False,
+        ),
+    )
+
+    tools = []
+    workspace_dir = Path("workspace") / "test_cli_note_tools"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        add_workspace_tools(tools, config, workspace_dir)
+        tool_names = [tool.name for tool in tools]
+        assert "record_note" in tool_names
+        assert "recall_notes" in tool_names
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)

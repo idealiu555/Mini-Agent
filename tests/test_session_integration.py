@@ -3,6 +3,7 @@ Session integration tests - Testing multi-turn conversations and session managem
 """
 
 import asyncio
+import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -196,3 +197,45 @@ def test_agent_rejects_cross_loop_reuse(temp_workspace):
     agent.add_user_message("second run")
     with pytest.raises(RuntimeError, match="same event loop"):
         asyncio.run(agent.run())
+
+
+@pytest.mark.asyncio
+async def test_run_with_explicit_cancel_event_does_not_leak_cancel_state():
+    """Per-run cancel_event should not affect later runs when omitted."""
+    llm_client = MagicMock(spec=LLMClient)
+    llm_client.generate = AsyncMock(
+        return_value=LLMResponse(
+            content="ok",
+            finish_reason="stop",
+            tool_calls=None,
+        )
+    )
+
+    workspace_dir = Path("workspace") / "test_cancel_state"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    agent = Agent(
+        llm_client=llm_client,
+        system_prompt="System",
+        tools=[],
+        workspace_dir=str(workspace_dir),
+    )
+    agent.logger.start_new_run = MagicMock()
+    agent.logger.get_log_file_path = MagicMock(return_value=Path("test.log"))
+
+    try:
+        # First run is cancelled via explicit cancel event.
+        agent.add_user_message("first run")
+        cancel_event = asyncio.Event()
+        cancel_event.set()
+        cancelled_result = await agent.run(cancel_event=cancel_event)
+        assert cancelled_result == "Task cancelled by user."
+        assert agent.cancel_event is None
+
+        # Second run should proceed normally.
+        agent.add_user_message("second run")
+        normal_result = await agent.run()
+        assert normal_result == "ok"
+        assert llm_client.generate.await_count == 1
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)

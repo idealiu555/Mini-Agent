@@ -4,7 +4,14 @@ import asyncio
 
 import pytest
 
-from mini_agent.tools.bash_tool import BackgroundShell, BackgroundShellManager, BashKillTool, BashOutputTool, BashTool
+from mini_agent.tools.bash_tool import (
+    BackgroundShell,
+    BackgroundShellManager,
+    BashKillTool,
+    BashOutputResult,
+    BashOutputTool,
+    BashTool,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -333,3 +340,16 @@ async def test_background_shell_terminate_waits_after_forced_kill(monkeypatch):
     assert wait_for_calls["count"] == 2
     assert process.wait_calls == 1
     assert shell.exit_code == -9
+
+
+def test_bash_output_result_preserves_explicit_content():
+    """Explicit content should not be overwritten by auto-formatting."""
+    result = BashOutputResult(
+        success=True,
+        content="Custom summary",
+        stdout="Background command started with ID: abc123",
+        stderr="",
+        exit_code=0,
+        bash_id="abc123",
+    )
+    assert result.content == "Custom summary"

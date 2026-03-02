@@ -754,47 +754,53 @@ Requirements:
             self._run_lock = asyncio.Lock()
 
         async with self._run_lock:
+            previous_cancel_event = self.cancel_event
             # Set cancellation event (can also be set via self.cancel_event before calling run())
             if cancel_event is not None:
                 self.cancel_event = cancel_event
 
-            # Start new run, initialize log file
-            self.logger.start_new_run()
-            print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
+            try:
+                # Start new run, initialize log file
+                self.logger.start_new_run()
+                print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
 
-            initial_state: AgentGraphState = {
-                "messages": self.messages.copy(),
-                "step": 0,
-                "done": False,
-                "final_response": "",
-                "run_start_time": perf_counter(),
-            }
+                initial_state: AgentGraphState = {
+                    "messages": self.messages.copy(),
+                    "step": 0,
+                    "done": False,
+                    "final_response": "",
+                    "run_start_time": perf_counter(),
+                }
 
-            # Per step, the theoretical traversal is ~4 transitions
-            # (summarize -> llm -> tools -> summarize). We use 6 as a safety margin
-            # to absorb extra transitions from conditional routing and edge cases,
-            # while keeping a floor of 100 for short runs.
-            TRANSITIONS_PER_STEP_MARGIN = 6
-            MIN_RECURSION_LIMIT = 100
-            recursion_limit = max(MIN_RECURSION_LIMIT, self.max_steps * TRANSITIONS_PER_STEP_MARGIN)
-            final_state = await self._graph.ainvoke(
-                initial_state,
-                config={"recursion_limit": recursion_limit},
-            )
+                # Per step, the theoretical traversal is ~4 transitions
+                # (summarize -> llm -> tools -> summarize). We use 6 as a safety margin
+                # to absorb extra transitions from conditional routing and edge cases,
+                # while keeping a floor of 100 for short runs.
+                TRANSITIONS_PER_STEP_MARGIN = 6
+                MIN_RECURSION_LIMIT = 100
+                recursion_limit = max(MIN_RECURSION_LIMIT, self.max_steps * TRANSITIONS_PER_STEP_MARGIN)
+                final_state = await self._graph.ainvoke(
+                    initial_state,
+                    config={"recursion_limit": recursion_limit},
+                )
 
-            self.messages = final_state.get("messages", self.messages)
+                self.messages = final_state.get("messages", self.messages)
 
-            final_response = final_state.get("final_response", "")
-            if final_response:
-                return final_response
+                final_response = final_state.get("final_response", "")
+                if final_response:
+                    return final_response
 
-            # Defensive fallback (should rarely happen)
-            if final_state.get("done", False):
-                return "Task completed."
+                # Defensive fallback (should rarely happen)
+                if final_state.get("done", False):
+                    return "Task completed."
 
-            error_msg = f"Task couldn't be completed after {self.max_steps} steps."
-            print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
-            return error_msg
+                error_msg = f"Task couldn't be completed after {self.max_steps} steps."
+                print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
+                return error_msg
+            finally:
+                # Explicit per-run cancel_event should not leak into later runs.
+                if cancel_event is not None:
+                    self.cancel_event = previous_cancel_event
 
     def get_history(self) -> list[Message]:
         """Get message history."""

@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from mini_agent.acp import MiniMaxACPAgent
+from mini_agent.acp import MiniMaxACPAgent, run_acp_server
 from mini_agent.config import AgentConfig, Config, LLMConfig, ToolsConfig
-from mini_agent.schema import FunctionCall, LLMResponse, ToolCall
+from mini_agent.schema import FunctionCall, LLMProvider, LLMResponse, ToolCall
 from mini_agent.tools.base import Tool, ToolResult
 
 
@@ -87,3 +87,35 @@ async def test_acp_invalid_session(acp_agent):
     prompt = SimpleNamespace(sessionId="missing", prompt=[{"text": "?"}])
     response = await agent.prompt(prompt)
     assert response.stopReason == "refusal"
+
+
+@pytest.mark.asyncio
+async def test_run_acp_server_uses_configured_provider(monkeypatch):
+    """ACP server should pass configured provider into LLMClient."""
+    captured_kwargs = {}
+
+    class FakeLLMClient:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    async def fake_initialize_base_tools(_config):
+        return [], None
+
+    async def fake_stdio_streams():
+        raise RuntimeError("stop-after-llm-init")
+
+    monkeypatch.setattr("mini_agent.acp.LLMClient", FakeLLMClient)
+    monkeypatch.setattr("mini_agent.acp.initialize_base_tools", fake_initialize_base_tools)
+    monkeypatch.setattr("mini_agent.acp.stdio_streams", fake_stdio_streams)
+    monkeypatch.setattr("mini_agent.acp.Config.find_config_file", classmethod(lambda _cls, _filename: None))
+
+    config = Config(
+        llm=LLMConfig(api_key="test-key", provider="openai"),
+        agent=AgentConfig(),
+        tools=ToolsConfig(),
+    )
+
+    with pytest.raises(RuntimeError, match="stop-after-llm-init"):
+        await run_acp_server(config)
+
+    assert captured_kwargs["provider"] == LLMProvider.OPENAI
